@@ -9,7 +9,7 @@ import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.PixelFormat
-import android.graphics.Rect
+import android.hardware.HardwareBuffer
 import android.hardware.display.DisplayManager
 import android.media.Image
 import android.media.ImageReader
@@ -89,67 +89,71 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     private val frameHandler = Handler(frameThread.looper)
 
     private var imageReader: ImageReader? = null
-    private val lastBitmapLock = Any()
-    private var lastBitmap: Bitmap? = null
-    private var lastCropRect: Rect? = null
 
-    @Volatile
-    private var lastPreviewDispatchAtMs = 0L
+    private val imageLock = Any()
+    private var heldImage: Image? = null
+    private var lastPreviewFrameAtMs = 0L
 
     private val imageListener = ImageReader.OnImageAvailableListener { reader ->
-        val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
-        image.use { handleImage(it) }
+        val image = reader.acquireNextImage() ?: return@OnImageAvailableListener
+
+        val previewed = try {
+            previewFrame(image)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to preview frame", e)
+            false
+        }
+
+        synchronized(imageLock) {
+            if (previewed || previewListeners.isEmpty()) {
+                heldImage?.close()
+                heldImage = image
+            } else {
+                // Skip
+                image.close()
+            }
+        }
     }
 
-    private fun handleImage(image: Image) {
-        try {
-            val width = image.width
-            val bitmapHeight = image.height
-            val planes = image.planes
-
-            val buffer = planes[0].buffer
-
-            val pixelStride = planes[0].pixelStride
-            val rowStride = planes[0].rowStride
-            val rowPadding = rowStride - pixelStride * width
-
-            val bitmapWidth = width + rowPadding / pixelStride
-
-            val currentBitmap = synchronized(lastBitmapLock) {
-                var currentBitmap = lastBitmap
-
-                // Initialize if null or not match
-                if (currentBitmap == null || currentBitmap.width != bitmapWidth || currentBitmap.height != bitmapHeight) {
-                    currentBitmap = createBitmap(bitmapWidth, bitmapHeight)
-                    this.lastBitmap = currentBitmap
-                    this.lastCropRect = image.cropRect
-                }
-
-                currentBitmap.copyPixelsFromBuffer(buffer)
-                currentBitmap
-            }
-
-            dispatchPreviewFrame(currentBitmap)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to handle image", e)
+    /**
+     * Hands a captured frame to the preview listeners, at most one per
+     * [PREVIEW_FRAME_INTERVAL_MS]. The buffer is already in GPU memory, so the bitmap
+     * references it directly and Compose scales it when drawing — no pixels are copied
+     * and nothing is uploaded.
+     *
+     * Returns whether the frame ends a preview interval, which is what makes the
+     * previously previewed frame safe to release.
+     */
+    private fun previewFrame(image: Image): Boolean {
+        if (previewListeners.isEmpty()) {
+            return false
         }
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastPreviewFrameAtMs < PREVIEW_FRAME_INTERVAL_MS) {
+            return false
+        }
+        lastPreviewFrameAtMs = now
+
+        val preview = image.hardwareBuffer?.let { buffer ->
+            buffer.use { buffer ->
+                Bitmap.wrapHardwareBuffer(buffer, null)
+            }
+        }
+        if (preview == null) {
+            return true
+        }
+
+        dispatchPreviewFrame(preview)
+        return true
     }
 
     private fun dispatchPreviewFrame(bitmap: Bitmap?) {
         if (previewListeners.isEmpty()) {
             return
         }
-        if (bitmap != null) {
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastPreviewDispatchAtMs < PREVIEW_FRAME_INTERVAL_MS) {
-                return
-            }
-            lastPreviewDispatchAtMs = now
-        }
-        val preview = bitmap?.let { scaleBitmapToMaxDimension(it, PREVIEW_MAX_DIMENSION) }
         previewListeners.forEach { listener ->
             try {
-                listener.onPreviewFrame(preview)
+                listener.onPreviewFrame(bitmap)
             } catch (e: Exception) {
                 Log.w(TAG, "Preview listener failed", e)
             }
@@ -182,6 +186,10 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         currentJob?.cancel()
         imageReader?.close()
         imageReader = null
+        synchronized(imageLock) {
+            heldImage?.close()
+            heldImage = null
+        }
         frameThread.quitSafely()
         previewListeners.clear()
         agentMessageListeners.clear()
@@ -233,7 +241,8 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
                 displayMetrics.widthPixels,
                 displayMetrics.heightPixels,
                 PixelFormat.RGBA_8888,
-                3,
+                4,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_READ_OFTEN,
             )
             reader.setOnImageAvailableListener(imageListener, frameHandler)
             if (service.startDisplay(
@@ -257,8 +266,9 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         val stopped = userService?.stopDisplay() ?: false
         imageReader?.close()
         imageReader = null
-        synchronized(lastBitmapLock) {
-            lastBitmap = null
+        synchronized(imageLock) {
+            heldImage?.close()
+            heldImage = null
         }
         dispatchPreviewFrame(null)
         return stopped
@@ -275,20 +285,23 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         userService?.startActivity(intent, false)
     }
 
-    fun getBitmap(): Bitmap? = synchronized(lastBitmapLock) {
-        val bitmap = lastBitmap ?: return@synchronized null
-        val cropRect = lastCropRect
-        if (cropRect != null) {
-            Bitmap.createBitmap(
-                bitmap,
-                cropRect.left,
-                cropRect.top,
-                cropRect.width(),
-                cropRect.height()
-            )
-        } else {
-            Bitmap.createBitmap(bitmap)
-        }
+    fun getBitmap(): Bitmap? = synchronized(imageLock) {
+        val image = heldImage ?: return@synchronized null
+        val plane = image.planes[0]
+        val width = image.width
+        val rowPadding = plane.rowStride - plane.pixelStride * width
+
+        val padded = createBitmap(width + rowPadding / plane.pixelStride, image.height)
+        padded.copyPixelsFromBuffer(plane.buffer)
+
+        val cropRect = image.cropRect
+        Bitmap.createBitmap(
+            padded,
+            cropRect.left,
+            cropRect.top,
+            cropRect.width(),
+            cropRect.height()
+        )
     }
 
     fun getFocusedAppName(): String? {
@@ -667,8 +680,7 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
 
     companion object {
         private const val TAG = "AgentService"
-        private const val PREVIEW_FRAME_INTERVAL_MS = 50L
-        private const val PREVIEW_MAX_DIMENSION = 1024
+        private const val PREVIEW_FRAME_INTERVAL_MS = 33L
         const val EXTRA_AGENT_PROMPT = "moe.reimu.nekoassistant.extra.AGENT_PROMPT"
         private const val FOREGROUND_CHANNEL_ID = "agent_job"
         private const val FOREGROUND_CHANNEL_NAME = "Agent job"
