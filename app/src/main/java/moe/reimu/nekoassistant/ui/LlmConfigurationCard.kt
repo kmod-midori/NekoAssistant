@@ -27,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,6 +36,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import moe.reimu.nekoassistant.ProviderManagementViewModel
 import moe.reimu.nekoassistant.data.LlmModelEntity
 import moe.reimu.nekoassistant.data.LlmProviderEntity
 import moe.reimu.nekoassistant.data.LlmProviderWithModels
@@ -68,16 +71,10 @@ fun SelectedLlmConfigurationCard(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProviderManagementPage(
-    providers: List<LlmProviderWithModels>,
     onBack: () -> Unit,
-    onCreateProvider: (name: String, baseUrl: String, apiKey: String) -> Unit,
-    onSaveProvider: (provider: LlmProviderEntity, name: String, baseUrl: String, apiKey: String) -> Unit,
-    onDeleteProvider: (LlmProviderEntity) -> Unit,
-    onCreateModel: (providerId: Long, name: String) -> Unit,
-    onSaveModel: (model: LlmModelEntity, name: String) -> Unit,
-    onDeleteModel: (LlmModelEntity) -> Unit,
-    onSelectModel: (modelId: Long) -> Unit,
+    viewModel: ProviderManagementViewModel = viewModel(),
 ) {
+    val providers by viewModel.providers.collectAsState()
     var providerBeingEdited by remember { mutableStateOf<LlmProviderEntity?>(null) }
     var isAddingProvider by remember { mutableStateOf(false) }
     var modelBeingEdited by remember { mutableStateOf<LlmModelEntity?>(null) }
@@ -128,9 +125,9 @@ fun ProviderManagementPage(
                     providerWithModels = providerWithModels,
                     onEditProvider = { providerBeingEdited = it },
                     onAddModel = { providerForNewModel = it },
-                    onSelectModel = onSelectModel,
+                    onSelectModel = viewModel::selectModel,
                     onEditModel = { modelBeingEdited = it },
-                    onDeleteModel = onDeleteModel,
+                    onDeleteModel = viewModel::deleteModel,
                 )
             }
         }
@@ -140,7 +137,7 @@ fun ProviderManagementPage(
         ProviderDialog(
             onDismiss = { isAddingProvider = false },
             onSave = { name, baseUrl, apiKey ->
-                onCreateProvider(name, baseUrl, apiKey)
+                viewModel.createProvider(name, baseUrl, apiKey)
                 isAddingProvider = false
             },
         )
@@ -150,11 +147,11 @@ fun ProviderManagementPage(
             provider = provider,
             onDismiss = { providerBeingEdited = null },
             onSave = { name, baseUrl, apiKey ->
-                onSaveProvider(provider, name, baseUrl, apiKey)
+                viewModel.saveProvider(provider, name, baseUrl, apiKey)
                 providerBeingEdited = null
             },
             onDelete = {
-                onDeleteProvider(provider)
+                viewModel.deleteProvider(provider)
                 providerBeingEdited = null
             },
         )
@@ -163,7 +160,7 @@ fun ProviderManagementPage(
         ModelDialog(
             onDismiss = { providerForNewModel = null },
             onSave = { name ->
-                onCreateModel(providerId, name)
+                viewModel.createModel(providerId, name)
                 providerForNewModel = null
             },
         )
@@ -173,7 +170,7 @@ fun ProviderManagementPage(
             model = model,
             onDismiss = { modelBeingEdited = null },
             onSave = { name ->
-                onSaveModel(model, name)
+                viewModel.saveModel(model, name)
                 modelBeingEdited = null
             },
         )

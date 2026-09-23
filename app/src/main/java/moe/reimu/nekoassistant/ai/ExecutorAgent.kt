@@ -29,6 +29,8 @@ class ExecutorAgent(
     private val screenshotHeight: Int,
     private val configuration: ActiveLlmConfiguration,
     private val client: OpenAI,
+    private val onStatus: (InferenceStatus) -> Unit = {},
+    private val onStream: (String) -> Unit = {},
 ) {
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -67,14 +69,23 @@ class ExecutorAgent(
             toolChoice = ToolChoice.Required,
         )
 
-        val message = client.streamChatMessage(chatRequest) { chunk ->
-            chunk.choices.forEach { choice ->
-                choice.delta?.content?.let { Log.d(TAG, "Executor stream: $it") }
-                choice.delta?.toolCalls?.forEach { toolCall ->
-                    toolCall.function?.argumentsOrNull?.let { Log.d(TAG, "Executor tool args: $it") }
+        val streamedText = StringBuilder()
+        val message = client.streamChatMessage(
+            request = chatRequest,
+            onChunk = { chunk ->
+                chunk.choices.forEach { choice ->
+                    choice.delta?.content?.let { delta ->
+                        Log.d(TAG, "Executor stream: $delta")
+                        streamedText.append(delta)
+                        onStream(streamedText.toString())
+                    }
+                    choice.delta?.toolCalls?.forEach { toolCall ->
+                        toolCall.function?.argumentsOrNull?.let { Log.d(TAG, "Executor tool args: $it") }
+                    }
                 }
-            }
-        } ?: return null
+            },
+            onStatus = onStatus,
+        ) ?: return null
 
         val toolCall = message.toolCalls?.firstOrNull() as? ToolCall.Function ?: return null
         val action = toAction(toolCall.function) ?: return null

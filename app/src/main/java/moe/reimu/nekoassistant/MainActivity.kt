@@ -6,7 +6,6 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -15,12 +14,13 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -29,7 +29,6 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -38,11 +37,18 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
 import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.PermissionState
 import com.google.accompanist.permissions.PermissionStatus
 import com.google.accompanist.permissions.rememberPermissionState
+import moe.reimu.nekoassistant.ai.InferenceStatus
 import moe.reimu.nekoassistant.ui.DefaultCard
 import moe.reimu.nekoassistant.ui.ProviderManagementPage
 import moe.reimu.nekoassistant.ui.SelectedLlmConfigurationCard
@@ -61,13 +67,30 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
 @Composable
 fun MainActivityContent() {
-    val mainViewModel: MainViewModel = viewModel()
+    val navController = rememberNavController()
+
+    Surface {
+        NavHost(
+            navController = navController,
+            startDestination = "main",
+        ) {
+            composable("main") {
+                MainPage(onManageProviders = { navController.navigate("providers") })
+            }
+            composable("providers") {
+                ProviderManagementPage(onBack = { navController.popBackStack() })
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
+@Composable
+fun MainPage(mainViewModel: MainViewModel = viewModel(), onManageProviders: () -> Unit) {
     val shizukuStatus = useShizukuStatus()
     val uiState by mainViewModel.uiState.collectAsState()
-    var isManagingProviders by rememberSaveable { mutableStateOf(false) }
     val notificationPermissionState = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
         rememberPermissionState(
             android.Manifest.permission.POST_NOTIFICATIONS
@@ -80,30 +103,27 @@ fun MainActivityContent() {
         }
     }
 
-    if (isManagingProviders) {
-        BackHandler { isManagingProviders = false }
-        ProviderManagementPage(
-            providers = uiState.llmProviders,
-            onBack = { isManagingProviders = false },
-            onCreateProvider = mainViewModel::createProvider,
-            onSaveProvider = mainViewModel::saveProvider,
-            onDeleteProvider = mainViewModel::deleteProvider,
-            onCreateModel = mainViewModel::createModel,
-            onSaveModel = mainViewModel::saveModel,
-            onDeleteModel = mainViewModel::deleteModel,
-            onSelectModel = mainViewModel::selectModel,
-        )
-        return
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_RESUME -> mainViewModel.setErrorListenerActive(true)
+                Lifecycle.Event.ON_PAUSE -> mainViewModel.setErrorListenerActive(false)
+                else -> {}
+            }
+        }
+
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
     }
 
     Scaffold(topBar = {
         TopAppBar(title = { Text(text = stringResource(R.string.app_name)) })
     }) { innerPadding ->
-        val listState = rememberLazyListState()
-
         LazyColumn(
             modifier = Modifier.padding(innerPadding),
-            state = listState,
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = PaddingValues(horizontal = 16.dp),
         ) {
@@ -129,7 +149,7 @@ fun MainActivityContent() {
             item {
                 SelectedLlmConfigurationCard(
                     providers = uiState.llmProviders,
-                    onClick = { isManagingProviders = true },
+                    onClick = onManageProviders,
                 )
             }
 
@@ -156,46 +176,83 @@ fun MainActivityContent() {
                                 .padding(top = 12.dp),
                             horizontalArrangement = Arrangement.End
                         ) {
-                            Button(
-                                enabled = uiState.agentPrompt.isNotBlank() &&
-                                    uiState.hasActiveLlmConfiguration,
-                                onClick = { mainViewModel.startAgent() }
-                            ) {
-                                Text("Go")
+                            if (uiState.isAgentRunning) {
+                                Button(onClick = { mainViewModel.stopAgent() }) {
+                                    Text("Stop")
+                                }
+                            } else {
+                                Button(
+                                    enabled = uiState.agentPrompt.isNotBlank() &&
+                                        uiState.hasActiveLlmConfiguration,
+                                    onClick = { mainViewModel.startAgent() }
+                                ) {
+                                    Text("Go")
+                                }
                             }
                         }
                     }
                 }
             }
 
-            uiState.latestMessage?.let { response ->
+            uiState.errorMessage?.let { message ->
                 item {
                     DefaultCard {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
-                                text = "Last Agent Action",
+                                text = "Error",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(bottom = 4.dp)
+                            )
+                            Text(
+                                text = message,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                    }
+                }
+            }
+
+            (uiState.agentMessages.keys + uiState.inferenceStatuses.keys).forEach { agent ->
+                item {
+                    DefaultCard {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = agent,
                                 style = MaterialTheme.typography.titleMedium,
                                 modifier = Modifier.padding(bottom = 8.dp)
                             )
-                            if (response.plan.isNotBlank()) {
+                            uiState.inferenceStatuses[agent]
+                                ?.takeUnless { it == InferenceStatus.IDLE }
+                                ?.let { status ->
+                                    Text(
+                                        text = when (status) {
+                                            InferenceStatus.WAITING -> "Waiting for response…"
+                                            InferenceStatus.STREAMING -> "Streaming response…"
+                                            InferenceStatus.ERROR -> "LLM inference failed"
+                                            InferenceStatus.IDLE -> "Idle"
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = if (status == InferenceStatus.ERROR) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurface
+                                        },
+                                    )
+                                    if (status != InferenceStatus.ERROR) {
+                                        LinearProgressIndicator(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(top = 8.dp)
+                                        )
+                                    }
+                                }
+                            uiState.agentMessages[agent]?.let { message ->
                                 Text(
-                                    text = "Plan: ${response.plan}",
+                                    text = message.content,
                                     style = MaterialTheme.typography.bodyMedium,
-                                    modifier = Modifier.padding(bottom = 4.dp)
                                 )
                             }
-                            if (response.agentResponse.think.isNotBlank()) {
-                                Text(
-                                    text = "Think: ${response.agentResponse.think}",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    modifier = Modifier.padding(bottom = 4.dp)
-                                )
-                            }
-                            Text(
-                                text = "Action: ${response.agentResponse.action}",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.primary
-                            )
                         }
                     }
                 }
@@ -206,7 +263,7 @@ fun MainActivityContent() {
                     DefaultCard {
                         Column(modifier = Modifier.padding(16.dp)) {
                             Text(
-                                text = "Preview (10 FPS)",
+                                text = "Preview",
                                 style = MaterialTheme.typography.titleMedium,
                                 modifier = Modifier.padding(bottom = 8.dp)
                             )

@@ -19,6 +19,8 @@ class PlannerAgent(
     userPrompt: String,
     private val configuration: ActiveLlmConfiguration,
     private val client: OpenAI,
+    private val onStatus: (InferenceStatus) -> Unit = {},
+    private val onStream: (String) -> Unit = {},
 ) {
     private val chatHistory = mutableListOf(
         ChatMessage(
@@ -51,11 +53,20 @@ class PlannerAgent(
             messages = chatHistory,
         )
 
-        val assistantMessage = client.streamChatMessage(chatRequest) { chunk ->
-            chunk.choices.forEach { choice ->
-                choice.delta?.content?.let { Log.d(TAG, "Planner stream: $it") }
-            }
-        } ?: return null
+        val streamedText = StringBuilder()
+        val assistantMessage = client.streamChatMessage(
+            request = chatRequest,
+            onChunk = { chunk ->
+                chunk.choices.forEach { choice ->
+                    choice.delta?.content?.let { delta ->
+                        Log.d(TAG, "Planner stream: $delta")
+                        streamedText.append(delta)
+                        onStream(streamedText.toString())
+                    }
+                }
+            },
+            onStatus = onStatus,
+        ) ?: return null
 
         chatHistory.add(assistantMessage)
 

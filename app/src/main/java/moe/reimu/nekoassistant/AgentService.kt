@@ -16,16 +16,20 @@ import android.util.Log
 import android.util.Size
 import androidx.core.app.NotificationCompat
 import androidx.core.graphics.scale
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import moe.reimu.nekoassistant.ai.Action
-import moe.reimu.nekoassistant.ai.AgentChatMessage
+import moe.reimu.nekoassistant.ai.AgentMessage
 import moe.reimu.nekoassistant.ai.ExecutorAgent
+import moe.reimu.nekoassistant.ai.InferenceStatus
 import moe.reimu.nekoassistant.ai.createLlmClient
 import moe.reimu.nekoassistant.ai.PlannerAgent
 import moe.reimu.nekoassistant.data.ActiveLlmConfiguration
@@ -101,7 +105,10 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         currentJob?.cancel()
         unregisterPreviewFrameBridge()
         previewListeners.clear()
-        conversationListeners.clear()
+        agentMessageListeners.clear()
+        inferenceStatusListeners.clear()
+        jobStateListeners.clear()
+        errorListeners.clear()
         stopJobForeground()
         try {
             userService?.destroy()
@@ -153,6 +160,13 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     }
 
     fun stopDisplay() = userService?.stopDisplay() ?: false
+
+    fun stopAgent() {
+        Log.i(TAG, "stopAgent requested")
+        currentJob?.cancel()
+    }
+
+    fun isAgentRunning(): Boolean = currentJob?.isActive == true
 
     fun startActivityRemote(intent: Intent) {
         userService?.startActivity(intent, false)
@@ -231,12 +245,27 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         fun onPreviewFrame(bitmap: Bitmap?)
     }
 
-    fun interface ConversationListener {
-        fun onConversationUpdate(message: AgentChatMessage)
+    fun interface AgentMessageListener {
+        fun onAgentMessage(message: AgentMessage)
+    }
+
+    fun interface InferenceStatusListener {
+        fun onInferenceStatus(agent: String, status: InferenceStatus)
+    }
+
+    fun interface JobStateListener {
+        fun onJobStateChanged(running: Boolean)
+    }
+
+    fun interface ErrorListener {
+        fun onError(message: String)
     }
 
     private val previewListeners = CopyOnWriteArraySet<PreviewListener>()
-    private val conversationListeners = CopyOnWriteArraySet<ConversationListener>()
+    private val agentMessageListeners = CopyOnWriteArraySet<AgentMessageListener>()
+    private val inferenceStatusListeners = CopyOnWriteArraySet<InferenceStatusListener>()
+    private val jobStateListeners = CopyOnWriteArraySet<JobStateListener>()
+    private val errorListeners = CopyOnWriteArraySet<ErrorListener>()
     private var previewListenerRegistered = false
 
     private val previewFrameBridge = object : IPreviewFrameListener.Stub() {
@@ -256,12 +285,18 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         configuration: ActiveLlmConfiguration,
         client: com.aallam.openai.client.OpenAI,
     ) {
-        val plannerAgent = PlannerAgent(userPrompt, configuration, client)
+        val plannerAgent = PlannerAgent(
+            userPrompt, configuration, client,
+            onStatus = { notifyInferenceStatusListeners("Planner", it) },
+            onStream = { notifyAgentMessage(AgentMessage("Planner", it)) },
+        )
         val executorAgent = ExecutorAgent(
             screenshotSize.width,
             screenshotSize.height,
             configuration,
             client,
+            onStatus = { notifyInferenceStatusListeners("Executor", it) },
+            onStream = { notifyAgentMessage(AgentMessage("Executor", it)) },
         )
 
         for (step in 0..<100) {
@@ -275,6 +310,7 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
                 Log.e(TAG, "Failed to plan")
                 break
             }
+            notifyAgentMessage(AgentMessage("Planner", planResult))
 
             // Parse action
             val agentResponse = executorAgent.execute(
@@ -287,8 +323,13 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
 
             Log.i(TAG, "Action: ${agentResponse.action}")
 
-            // Notify conversation listeners with updated history
-            notifyConversationListeners(AgentChatMessage(planResult, agentResponse))
+            val executorText = buildString {
+                if (agentResponse.think.isNotBlank()) {
+                    appendLine("Think: ${agentResponse.think}")
+                }
+                append("Action: ${agentResponse.action}")
+            }
+            notifyAgentMessage(AgentMessage("Executor", executorText))
 
             // Check if we're done
             if (agentResponse.action is Action.Finish) {
@@ -347,10 +388,14 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
                     createLlmClient(configuration).use { client ->
                         mainJob(agentPrompt, configuration, client)
                     }
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     Log.e(TAG, "mainJob failed", e)
+                    notifyError(e.message ?: "Agent job failed")
                 } finally {
                     currentJob = null
+                    notifyJobState(false)
                     stopJobForeground()
                     if (!stopDisplay()) {
                         Log.e(TAG, "Failed to stop display")
@@ -358,6 +403,7 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
                 }
             }
         }
+        notifyJobState(true)
 
         return START_NOT_STICKY
     }
@@ -408,6 +454,28 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
             )
             .build()
 
+    private fun postErrorNotification(message: String) {
+        ensureForegroundNotificationChannel()
+        val notification = NotificationCompat.Builder(this, FOREGROUND_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("NekoAssistant error")
+            .setContentText(message)
+            .setAutoCancel(true)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this,
+                    0,
+                    Intent(this, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                    },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(ERROR_NOTIFICATION_ID, notification)
+    }
+
     fun addPreviewListener(listener: PreviewListener) {
         if (previewListeners.add(listener)) {
             updatePreviewFrameBridgeRegistration()
@@ -420,20 +488,81 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         }
     }
 
-    fun addConversationListener(listener: ConversationListener) {
-        conversationListeners.add(listener)
+    fun addAgentMessageListener(listener: AgentMessageListener) {
+        agentMessageListeners.add(listener)
     }
 
-    fun removeConversationListener(listener: ConversationListener) {
-        conversationListeners.remove(listener)
+    fun removeAgentMessageListener(listener: AgentMessageListener) {
+        agentMessageListeners.remove(listener)
     }
 
-    private fun notifyConversationListeners(message: AgentChatMessage) {
-        conversationListeners.forEach { listener ->
+    fun addInferenceStatusListener(listener: InferenceStatusListener) {
+        inferenceStatusListeners.add(listener)
+    }
+
+    fun removeInferenceStatusListener(listener: InferenceStatusListener) {
+        inferenceStatusListeners.remove(listener)
+    }
+
+    fun addJobStateListener(listener: JobStateListener) {
+        jobStateListeners.add(listener)
+    }
+
+    fun removeJobStateListener(listener: JobStateListener) {
+        jobStateListeners.remove(listener)
+    }
+
+    fun addErrorListener(listener: ErrorListener) {
+        errorListeners.add(listener)
+    }
+
+    fun removeErrorListener(listener: ErrorListener) {
+        errorListeners.remove(listener)
+    }
+
+    private fun notifyJobState(running: Boolean) {
+        jobStateListeners.forEach { listener ->
             try {
-                listener.onConversationUpdate(message)
+                listener.onJobStateChanged(running)
             } catch (e: Exception) {
-                Log.w(TAG, "Conversation listener failed", e)
+                Log.w(TAG, "Job state listener failed", e)
+            }
+        }
+    }
+
+    private fun notifyError(message: String) {
+        Log.e(TAG, "Agent error: $message")
+        val foreground = ProcessLifecycleOwner.get()
+            .lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)
+        if (foreground && errorListeners.isNotEmpty()) {
+            errorListeners.forEach { listener ->
+                try {
+                    listener.onError(message)
+                } catch (e: Exception) {
+                    Log.w(TAG, "Error listener failed", e)
+                }
+            }
+        } else {
+            postErrorNotification(message)
+        }
+    }
+
+    private fun notifyInferenceStatusListeners(agent: String, status: InferenceStatus) {
+        inferenceStatusListeners.forEach { listener ->
+            try {
+                listener.onInferenceStatus(agent, status)
+            } catch (e: Exception) {
+                Log.w(TAG, "Inference status listener failed", e)
+            }
+        }
+    }
+
+    private fun notifyAgentMessage(message: AgentMessage) {
+        agentMessageListeners.forEach { listener ->
+            try {
+                listener.onAgentMessage(message)
+            } catch (e: Exception) {
+                Log.w(TAG, "Agent message listener failed", e)
             }
         }
     }
@@ -482,5 +611,6 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         private const val FOREGROUND_CHANNEL_NAME = "Agent job"
         private const val FOREGROUND_CHANNEL_DESCRIPTION = "Runs agent automation tasks"
         private const val FOREGROUND_NOTIFICATION_ID = 1001
+        private const val ERROR_NOTIFICATION_ID = 1002
     }
 }

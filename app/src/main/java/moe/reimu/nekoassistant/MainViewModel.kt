@@ -17,17 +17,19 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import moe.reimu.nekoassistant.ai.AgentChatMessage
+import moe.reimu.nekoassistant.ai.AgentMessage
+import moe.reimu.nekoassistant.ai.InferenceStatus
 import moe.reimu.nekoassistant.data.LlmConfigurationRepository
-import moe.reimu.nekoassistant.data.LlmModelEntity
-import moe.reimu.nekoassistant.data.LlmProviderEntity
 import moe.reimu.nekoassistant.data.LlmProviderWithModels
 
 data class UiState(
     val isServiceConnected: Boolean = false,
+    val isAgentRunning: Boolean = false,
     val previewBitmap: Bitmap? = null,
     val agentPrompt: String = "",
-    val latestMessage: AgentChatMessage? = null,
+    val agentMessages: Map<String, AgentMessage> = emptyMap(),
+    val inferenceStatuses: Map<String, InferenceStatus> = emptyMap(),
+    val errorMessage: String? = null,
     val llmProviders: List<LlmProviderWithModels> = emptyList(),
 ) {
     val hasActiveLlmConfiguration: Boolean
@@ -41,43 +43,66 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val llmConfigurationRepository = LlmConfigurationRepository(application)
 
-    private val previewListener = AgentService.PreviewListener { bitmap ->
+    private fun updateUi(block: (UiState) -> UiState) {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            _uiState.value = _uiState.value.copy(previewBitmap = bitmap)
+            _uiState.value = block(_uiState.value)
         } else {
-            mainHandler.post {
-                _uiState.value = _uiState.value.copy(previewBitmap = bitmap)
-            }
+            mainHandler.post { _uiState.value = block(_uiState.value) }
         }
     }
 
-    private val conversationListener = AgentService.ConversationListener { message ->
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            _uiState.value = _uiState.value.copy(latestMessage = message)
-        } else {
-            mainHandler.post {
-                _uiState.value = _uiState.value.copy(latestMessage = message)
-            }
+    private val previewListener = AgentService.PreviewListener { bitmap ->
+        updateUi { it.copy(previewBitmap = bitmap) }
+    }
+
+    private val agentMessageListener = AgentService.AgentMessageListener { message ->
+        updateUi { it.copy(agentMessages = it.agentMessages + (message.agent to message)) }
+    }
+
+    private val inferenceStatusListener = AgentService.InferenceStatusListener { agent, status ->
+        updateUi { it.copy(inferenceStatuses = it.inferenceStatuses + (agent to status)) }
+    }
+
+    private val jobStateListener = AgentService.JobStateListener { running ->
+        updateUi {
+            it.copy(
+                isAgentRunning = running,
+                errorMessage = if (running) null else it.errorMessage,
+            )
         }
+    }
+
+    private val errorListener = AgentService.ErrorListener { message ->
+        updateUi { it.copy(errorMessage = message) }
     }
 
     @SuppressLint("StaticFieldLeak")
     private var agentService: AgentService? = null
+    private var errorListenerActive = false
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(p0: ComponentName, p1: IBinder) {
             val service = (p1 as AgentService.LocalBinder).getService()
             agentService = service
-            _uiState.value = _uiState.value.copy(isServiceConnected = true)
-            registerPreviewListener(service)
+            _uiState.value = _uiState.value.copy(
+                isServiceConnected = true,
+                isAgentRunning = service.isAgentRunning(),
+            )
+            registerServiceListeners(service)
+            if (errorListenerActive) {
+                service.addErrorListener(errorListener)
+            }
         }
 
         override fun onServiceDisconnected(p0: ComponentName) {
             agentService = null
             _uiState.value = _uiState.value.copy(
                 isServiceConnected = false,
+                isAgentRunning = false,
                 previewBitmap = null,
-                latestMessage = null,
+                agentMessages = emptyMap(),
+                inferenceStatuses = emptyMap(),
+                errorMessage = null,
             )
         }
     }
@@ -96,42 +121,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         application.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
-    private fun registerPreviewListener(service: AgentService) {
+    private fun registerServiceListeners(service: AgentService) {
         service.addPreviewListener(previewListener)
-        service.addConversationListener(conversationListener)
+        service.addAgentMessageListener(agentMessageListener)
+        service.addInferenceStatusListener(inferenceStatusListener)
+        service.addJobStateListener(jobStateListener)
+    }
+
+    private fun removeServiceListeners(service: AgentService) {
+        service.removePreviewListener(previewListener)
+        service.removeAgentMessageListener(agentMessageListener)
+        service.removeInferenceStatusListener(inferenceStatusListener)
+        service.removeJobStateListener(jobStateListener)
     }
 
     fun updateAgentPrompt(prompt: String) {
         _uiState.value = _uiState.value.copy(agentPrompt = prompt)
-    }
-
-    fun createProvider(name: String, baseUrl: String, apiKey: String) = viewModelScope.launch {
-        llmConfigurationRepository.createProvider(name, baseUrl, apiKey)
-    }
-
-    fun saveProvider(provider: LlmProviderEntity, name: String, baseUrl: String, apiKey: String) =
-        viewModelScope.launch {
-            llmConfigurationRepository.saveProvider(provider, name, baseUrl, apiKey)
-        }
-
-    fun deleteProvider(provider: LlmProviderEntity) = viewModelScope.launch {
-        llmConfigurationRepository.deleteProvider(provider)
-    }
-
-    fun createModel(providerId: Long, name: String) = viewModelScope.launch {
-        llmConfigurationRepository.createModel(providerId, name)
-    }
-
-    fun saveModel(model: LlmModelEntity, name: String) = viewModelScope.launch {
-        llmConfigurationRepository.saveModel(model, name)
-    }
-
-    fun deleteModel(model: LlmModelEntity) = viewModelScope.launch {
-        llmConfigurationRepository.deleteModel(model)
-    }
-
-    fun selectModel(modelId: Long) = viewModelScope.launch {
-        llmConfigurationRepository.selectModel(modelId)
     }
 
     fun startAgent() {
@@ -146,10 +151,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         application.startService(intent)
     }
 
+    fun stopAgent() {
+        agentService?.stopAgent()
+    }
+
+    fun setErrorListenerActive(active: Boolean) {
+        errorListenerActive = active
+        val service = agentService ?: return
+        if (active) service.addErrorListener(errorListener) else service.removeErrorListener(errorListener)
+    }
+
     override fun onCleared() {
-        super.onCleared()
-        agentService?.removePreviewListener(previewListener)
-        agentService?.removeConversationListener(conversationListener)
+        agentService?.let { removeServiceListeners(it) }
+        agentService?.removeErrorListener(errorListener)
         if (agentService != null) {
             application.unbindService(serviceConnection)
             agentService = null

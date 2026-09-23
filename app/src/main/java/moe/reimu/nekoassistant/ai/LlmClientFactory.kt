@@ -27,12 +27,25 @@ fun createLlmClient(configuration: ActiveLlmConfiguration) = OpenAI(
 suspend fun OpenAI.streamChatMessage(
     request: ChatCompletionRequest,
     onChunk: (ChatCompletionChunk) -> Unit = {},
+    onStatus: (InferenceStatus) -> Unit = {},
 ): ChatMessage? {
+    onStatus(InferenceStatus.WAITING)
     val chunks = mutableListOf<ChatChunk>()
-    chatCompletions(request).collect { chunk ->
-        onChunk(chunk)
-        chunks.addAll(chunk.choices)
+    try {
+        var streaming = false
+        chatCompletions(request).collect { chunk ->
+            if (!streaming) {
+                streaming = true
+                onStatus(InferenceStatus.STREAMING)
+            }
+            onChunk(chunk)
+            chunks.addAll(chunk.choices)
+        }
+    } catch (e: Exception) {
+        onStatus(InferenceStatus.ERROR)
+        throw e
     }
+    onStatus(InferenceStatus.IDLE)
     if (chunks.isEmpty()) return null
     return chunks.mergeToChatMessage()
 }
