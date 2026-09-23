@@ -224,29 +224,30 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     suspend fun startDisplay(): Boolean {
         for (i in 0 until 10) {
             val service = userService
-            if (service != null) {
-                val reader = ImageReader.newInstance(
+            if (service == null) {
+                Log.i(TAG, "Waiting for user service to connect... ($i)")
+                delay(1000.milliseconds)
+                continue
+            }
+            val reader = ImageReader.newInstance(
+                displayMetrics.widthPixels,
+                displayMetrics.heightPixels,
+                PixelFormat.RGBA_8888,
+                3,
+            )
+            reader.setOnImageAvailableListener(imageListener, frameHandler)
+            if (service.startDisplay(
                     displayMetrics.widthPixels,
                     displayMetrics.heightPixels,
-                    PixelFormat.RGBA_8888,
-                    3,
-                )
-                reader.setOnImageAvailableListener(imageListener, frameHandler)
-                if (service.startDisplay(
-                        displayMetrics.widthPixels,
-                        displayMetrics.heightPixels,
-                        displayMetrics.densityDpi,
-                        reader.surface,
-                    )
-                ) {
-                    imageReader = reader
-                    return true
-                }
+                    displayMetrics.densityDpi,
+                    reader.surface
+            )) {
+                imageReader = reader
+                return true
+            } else {
                 reader.close()
                 return false
             }
-            Log.i(TAG, "Waiting for user service to connect... ($i)")
-            delay(1000)
         }
         Log.e(TAG, "User service did not connect in time")
         return false
