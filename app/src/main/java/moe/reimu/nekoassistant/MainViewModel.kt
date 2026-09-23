@@ -17,7 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import moe.reimu.nekoassistant.ai.AgentMessage
+import moe.reimu.nekoassistant.ai.ChatMessage
 import moe.reimu.nekoassistant.ai.InferenceStatus
 import moe.reimu.nekoassistant.data.LlmConfigurationRepository
 import moe.reimu.nekoassistant.data.LlmProviderWithModels
@@ -27,7 +27,7 @@ data class UiState(
     val isAgentRunning: Boolean = false,
     val previewBitmap: Bitmap? = null,
     val agentPrompt: String = "",
-    val agentMessages: Map<String, AgentMessage> = emptyMap(),
+    val messages: List<ChatMessage> = emptyList(),
     val inferenceStatuses: Map<String, InferenceStatus> = emptyMap(),
     val errorMessage: String? = null,
     val llmProviders: List<LlmProviderWithModels> = emptyList(),
@@ -55,8 +55,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         updateUi { it.copy(previewBitmap = bitmap) }
     }
 
-    private val agentMessageListener = AgentService.AgentMessageListener { message ->
-        updateUi { it.copy(agentMessages = it.agentMessages + (message.agent to message)) }
+    private val transcriptListener = AgentService.TranscriptListener { messages ->
+        updateUi { it.copy(messages = messages) }
     }
 
     private val inferenceStatusListener = AgentService.InferenceStatusListener { agent, status ->
@@ -87,6 +87,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             _uiState.value = _uiState.value.copy(
                 isServiceConnected = true,
                 isAgentRunning = service.isAgentRunning(),
+                // A run may have started before this screen existed, so take whatever the
+                // service has rather than starting from an empty transcript.
+                messages = service.getTranscript(),
+                inferenceStatuses = service.getInferenceStatuses(),
             )
             registerServiceListeners(service)
             if (errorListenerActive) {
@@ -100,7 +104,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 isServiceConnected = false,
                 isAgentRunning = false,
                 previewBitmap = null,
-                agentMessages = emptyMap(),
                 inferenceStatuses = emptyMap(),
                 errorMessage = null,
             )
@@ -123,14 +126,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun registerServiceListeners(service: AgentService) {
         service.addPreviewListener(previewListener)
-        service.addAgentMessageListener(agentMessageListener)
+        service.addTranscriptListener(transcriptListener)
         service.addInferenceStatusListener(inferenceStatusListener)
         service.addJobStateListener(jobStateListener)
     }
 
     private fun removeServiceListeners(service: AgentService) {
         service.removePreviewListener(previewListener)
-        service.removeAgentMessageListener(agentMessageListener)
+        service.removeTranscriptListener(transcriptListener)
         service.removeInferenceStatusListener(inferenceStatusListener)
         service.removeJobStateListener(jobStateListener)
     }
@@ -140,10 +143,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun startAgent() {
-        val prompt = _uiState.value.agentPrompt
+        val prompt = _uiState.value.agentPrompt.trim()
         if (prompt.isBlank()) {
             return
         }
+
+        // The bubble comes back from the service with the rest of the transcript.
+        _uiState.value = _uiState.value.copy(agentPrompt = "")
 
         val intent = Intent(getApplication(), AgentService::class.java).apply {
             putExtra(AgentService.EXTRA_AGENT_PROMPT, prompt)
@@ -153,6 +159,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopAgent() {
         agentService?.stopAgent()
+    }
+
+    fun newChat() {
+        agentService?.clearTranscript()
     }
 
     fun setErrorListenerActive(active: Boolean) {

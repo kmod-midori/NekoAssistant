@@ -36,6 +36,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
 import moe.reimu.nekoassistant.ai.Action
 import moe.reimu.nekoassistant.ai.AgentMessage
+import moe.reimu.nekoassistant.ai.ChatMessage
 import moe.reimu.nekoassistant.ai.ExecutorAgent
 import moe.reimu.nekoassistant.ai.InferenceStatus
 import moe.reimu.nekoassistant.ai.createLlmClient
@@ -192,7 +193,7 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         }
         frameThread.quitSafely()
         previewListeners.clear()
-        agentMessageListeners.clear()
+        transcriptListeners.clear()
         inferenceStatusListeners.clear()
         jobStateListeners.clear()
         errorListeners.clear()
@@ -373,8 +374,8 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         fun onPreviewFrame(bitmap: Bitmap?)
     }
 
-    fun interface AgentMessageListener {
-        fun onAgentMessage(message: AgentMessage)
+    fun interface TranscriptListener {
+        fun onTranscriptChanged(messages: List<ChatMessage>)
     }
 
     fun interface InferenceStatusListener {
@@ -390,7 +391,15 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     }
 
     private val previewListeners = CopyOnWriteArraySet<PreviewListener>()
-    private val agentMessageListeners = CopyOnWriteArraySet<AgentMessageListener>()
+
+    // The conversation lives here, not in the screen, so closing the activity mid-run and
+    // reopening it resumes the same transcript.
+    private val transcript = mutableListOf<ChatMessage>()
+    private val transcriptListeners = CopyOnWriteArraySet<TranscriptListener>()
+
+    // What each agent is doing right now, kept here for the same reason: reopening the
+    // screen mid-run should show that an inference is in flight, not an idle chat.
+    private val inferenceStatuses = mutableMapOf<String, InferenceStatus>()
     private val inferenceStatusListeners = CopyOnWriteArraySet<InferenceStatusListener>()
     private val jobStateListeners = CopyOnWriteArraySet<JobStateListener>()
     private val errorListeners = CopyOnWriteArraySet<ErrorListener>()
@@ -400,6 +409,12 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         configuration: ActiveLlmConfiguration,
         client: com.aallam.openai.client.OpenAI,
     ) {
+        updateTranscript {
+            it.add(
+                ChatMessage("You", userPrompt, System.currentTimeMillis(), fromUser = true)
+            )
+        }
+
         val plannerAgent = PlannerAgent(
             userPrompt, configuration, client,
             onStatus = { notifyInferenceStatusListeners("Planner", it) },
@@ -599,12 +614,12 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         previewListeners.remove(listener)
     }
 
-    fun addAgentMessageListener(listener: AgentMessageListener) {
-        agentMessageListeners.add(listener)
+    fun addTranscriptListener(listener: TranscriptListener) {
+        transcriptListeners.add(listener)
     }
 
-    fun removeAgentMessageListener(listener: AgentMessageListener) {
-        agentMessageListeners.remove(listener)
+    fun removeTranscriptListener(listener: TranscriptListener) {
+        transcriptListeners.remove(listener)
     }
 
     fun addInferenceStatusListener(listener: InferenceStatusListener) {
@@ -658,7 +673,12 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         }
     }
 
+    fun getInferenceStatuses(): Map<String, InferenceStatus> =
+        synchronized(inferenceStatuses) { inferenceStatuses.toMap() }
+
     private fun notifyInferenceStatusListeners(agent: String, status: InferenceStatus) {
+        synchronized(inferenceStatuses) { inferenceStatuses[agent] = status }
+
         inferenceStatusListeners.forEach { listener ->
             try {
                 listener.onInferenceStatus(agent, status)
@@ -668,12 +688,40 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         }
     }
 
-    private fun notifyAgentMessage(message: AgentMessage) {
-        agentMessageListeners.forEach { listener ->
+    fun getTranscript(): List<ChatMessage> = synchronized(transcript) { transcript.toList() }
+
+    /**
+     * Adds a turn to the transcript. A turn arrives as many streaming updates followed by
+     * the final text, all under the same sender, so a message from whoever spoke last
+     * replaces their turn; anyone else starts a new one.
+     */
+    private fun notifyAgentMessage(message: AgentMessage) = updateTranscript { messages ->
+        val last = messages.lastOrNull()
+        if (last != null && !last.fromUser && last.sender == message.agent) {
+            // Same turn still streaming: keep when it started, not when it last grew.
+            messages[messages.lastIndex] = ChatMessage(
+                message.agent, message.content, last.timestamp
+            )
+        } else {
+            messages.add(
+                ChatMessage(message.agent, message.content, System.currentTimeMillis())
+            )
+        }
+    }
+
+    fun clearTranscript() = updateTranscript { it.clear() }
+
+    private fun updateTranscript(block: (MutableList<ChatMessage>) -> Unit) {
+        val updated = synchronized(transcript) {
+            block(transcript)
+            transcript.toList()
+        }
+
+        transcriptListeners.forEach { listener ->
             try {
-                listener.onAgentMessage(message)
+                listener.onTranscriptChanged(updated)
             } catch (e: Exception) {
-                Log.w(TAG, "Agent message listener failed", e)
+                Log.w(TAG, "Transcript listener failed", e)
             }
         }
     }
