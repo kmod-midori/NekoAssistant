@@ -1,6 +1,6 @@
 package moe.reimu.nekoassistant.ai
 
-import com.aallam.openai.api.chat.ChatCompletion
+import android.util.Log
 import com.aallam.openai.api.chat.ChatCompletionRequest
 import com.aallam.openai.api.chat.ChatMessage
 import com.aallam.openai.api.chat.ChatRole
@@ -20,7 +20,7 @@ class PlannerAgent(
     private val configuration: ActiveLlmConfiguration,
     private val client: OpenAI,
 ) {
-    private val chatHistory = mutableListOf<ChatMessage>(
+    private val chatHistory = mutableListOf(
         ChatMessage(
             role = ChatRole.System,
             content = getPlannerSystemPrompt(
@@ -50,9 +50,14 @@ class PlannerAgent(
             model = ModelId(configuration.modelName),
             messages = chatHistory,
         )
-        val completion: ChatCompletion = client.chatCompletion(chatRequest)
-        val message = completion.choices.first().message
-        chatHistory.add(message)
+
+        val assistantMessage = client.streamChatMessage(chatRequest) { chunk ->
+            chunk.choices.forEach { choice ->
+                choice.delta?.content?.let { Log.d(TAG, "Planner stream: $it") }
+            }
+        } ?: return null
+
+        chatHistory.add(assistantMessage)
 
         // Remove images
         chatHistory.replaceAll { message ->
@@ -66,10 +71,20 @@ class PlannerAgent(
                 }
             }
         }
-        return message.content?.replace(thinkingRegex, "")
+        return assistantMessage.content?.replace(thinkingRegex, "")
+    }
+
+    fun addActionResult(prompt: String) {
+        chatHistory.add(
+            ChatMessage(
+                role = ChatRole.User,
+                content = "上一步操作执行结果：$prompt"
+            )
+        )
     }
 
     companion object {
+        private const val TAG = "PlannerAgent"
         private val thinkingRegex = """<think>(.*?)</think>""".toRegex(RegexOption.DOT_MATCHES_ALL)
     }
 }

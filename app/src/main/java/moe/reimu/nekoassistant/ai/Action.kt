@@ -2,18 +2,13 @@ package moe.reimu.nekoassistant.ai
 
 import android.content.ClipData
 import android.content.ClipboardManager
-import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
 import android.util.Log
-import android.view.InputDevice
-import android.view.KeyCharacterMap
 import android.view.KeyEvent
-import android.view.MotionEvent
 import kotlinx.coroutines.delay
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import moe.reimu.nekoassistant.AgentService
-import kotlin.emptyArray
 import kotlin.math.pow
 import kotlin.random.Random
 import kotlin.random.nextLong
@@ -23,46 +18,45 @@ sealed class Action {
     open suspend fun execute(service: AgentService): ActionResult = ActionResult.success()
 
     @Serializable
-    @SerialName("Launch")
-    data class Launch(val app: String) : Action() {
+    @SerialName("SearchApp")
+    data class SearchApp(val query: String) : Action() {
         override suspend fun execute(service: AgentService): ActionResult {
+            if (query.isBlank()) {
+                return ActionResult.retry("SearchApp 的 query 不能为空")
+            }
             val packageManager = service.packageManager
-
-            // Get all installed apps
             val installedApps =
                 packageManager.getInstalledApplications(PackageManager.GET_META_DATA)
-
-            // Search for matching app by name
-            val matchingApp = installedApps.firstOrNull { appInfo ->
-                val appName = packageManager.getApplicationLabel(appInfo).toString()
-                appName.contains(app, ignoreCase = true) ||
-                        appInfo.packageName.contains(app, ignoreCase = true)
-            }
-
-            return if (matchingApp != null) {
-                val launchIntent = packageManager.getLaunchIntentForPackage(matchingApp.packageName)
-                if (launchIntent != null) {
-                    Log.i(
-                        TAG,
-                        "Launching app: ${packageManager.getApplicationLabel(matchingApp)} (${matchingApp.packageName})"
-                    )
-                    service.startActivityRemote(launchIntent)
-                    delay(5000)
-                    ActionResult.success()
+            val matches = installedApps.mapNotNull { appInfo ->
+                val name = packageManager.getApplicationLabel(appInfo).toString()
+                val pkg = appInfo.packageName
+                if (name.contains(query, ignoreCase = true) || pkg.contains(query, ignoreCase = true)) {
+                    "$name ($pkg)"
                 } else {
-                    Log.e(TAG, "No launch intent found for package: ${matchingApp.packageName}")
-                    ActionResult.fail("找到 App 但无法打开")
+                    null
                 }
+            }
+            return if (matches.isEmpty()) {
+                ActionResult.retry("没有找到匹配 \"$query\" 的应用，请尝试其他关键词")
             } else {
-                Log.e(TAG, "No app found matching: $app")
+                ActionResult.success("匹配的应用：\n" + matches.joinToString("\n"))
+            }
+        }
+    }
 
-                // Log available apps for debugging
-                val appNames = installedApps
-                    .map { packageManager.getApplicationLabel(it).toString() }
-                    .sorted()
-                Log.d(TAG, "Available apps: ${appNames.joinToString(", ")}")
-
-                ActionResult(false, "没有找到请求的App，请尝试其他名称")
+    @Serializable
+    @SerialName("Launch")
+    data class Launch(val packageName: String) : Action() {
+        override suspend fun execute(service: AgentService): ActionResult {
+            val launchIntent = service.packageManager.getLaunchIntentForPackage(packageName)
+            return if (launchIntent != null) {
+                Log.i(TAG, "Launching app: $packageName")
+                service.startActivityRemote(launchIntent)
+                delay(5000)
+                ActionResult.success()
+            } else {
+                Log.e(TAG, "No launch intent found for package: $packageName")
+                ActionResult.retry("找不到包名 $packageName 对应的应用，请先调用 SearchApp 搜索获取正确包名")
             }
         }
 
@@ -148,15 +142,27 @@ sealed class Action {
 
     @Serializable
     @SerialName("Long_Press")
-    data class LongPress(val x: Int, val y: Int) : Action()
+    data class LongPress(val x: Int, val y: Int) : Action() {
+        // ponytail: stub — no real implementation yet
+        override suspend fun execute(service: AgentService): ActionResult =
+            ActionResult.fail("LongPress 尚未实现")
+    }
 
     @Serializable
     @SerialName("Double_Tap")
-    data class DoubleTap(val x: Int, val y: Int) : Action()
+    data class DoubleTap(val x: Int, val y: Int) : Action() {
+        // ponytail: stub — no real implementation yet
+        override suspend fun execute(service: AgentService): ActionResult =
+            ActionResult.fail("DoubleTap 尚未实现")
+    }
 
     @Serializable
     @SerialName("Take_over")
-    data class TakeOver(val message: String) : Action()
+    data class TakeOver(val message: String) : Action() {
+        // ponytail: stub — no real implementation yet
+        override suspend fun execute(service: AgentService): ActionResult =
+            ActionResult.fail("TakeOver 尚未实现")
+    }
 
     @Serializable
     @SerialName("Back")
@@ -171,7 +177,11 @@ sealed class Action {
 
     @Serializable
     @SerialName("Home")
-    data object Home : Action()
+    data object Home : Action() {
+        // ponytail: stub — no real implementation yet
+        override suspend fun execute(service: AgentService): ActionResult =
+            ActionResult.fail("Home 尚未实现")
+    }
 
     @Serializable
     @SerialName("Wait")

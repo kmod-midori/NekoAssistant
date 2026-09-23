@@ -34,6 +34,7 @@ import rikka.shizuku.Shizuku
 import java.io.ByteArrayOutputStream
 import java.util.Base64
 import java.util.concurrent.CopyOnWriteArraySet
+import kotlin.time.Duration.Companion.milliseconds
 
 class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     Shizuku.OnRequestPermissionResultListener {
@@ -301,11 +302,12 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
                 Log.i(TAG, "actionResult.stop == true, stopping")
                 break
             }
-            delay(3000) // Wait for the action to take effect and screen to update
+            plannerAgent.addActionResult(actionResult.prompt)
+            delay(3000.milliseconds) // Wait for the action to take effect and screen to update
         }
 
         Log.i(TAG, "Agent loop completed")
-        delay(1000 * 10)
+        delay((1000 * 10).milliseconds)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
