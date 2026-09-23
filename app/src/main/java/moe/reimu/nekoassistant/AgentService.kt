@@ -8,13 +8,21 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.PixelFormat
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
+import android.media.Image
+import android.media.ImageReader
 import android.os.Binder
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
+import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
 import android.util.Size
 import androidx.core.app.NotificationCompat
+import androidx.core.graphics.createBitmap
 import androidx.core.graphics.scale
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleService
@@ -69,13 +77,82 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         override fun onServiceConnected(p0: ComponentName, p1: IBinder) {
             Log.i(TAG, "UserService onServiceConnected")
             userService = IUserService.Stub.asInterface(p1)
-            updatePreviewFrameBridgeRegistration()
         }
 
         override fun onServiceDisconnected(p0: ComponentName) {
             Log.i(TAG, "UserService onServiceDisconnected")
             userService = null
-            updatePreviewFrameBridgeRegistration()
+        }
+    }
+
+    private val frameThread = HandlerThread("display-frames").apply { start() }
+    private val frameHandler = Handler(frameThread.looper)
+
+    private var imageReader: ImageReader? = null
+    private val lastBitmapLock = Any()
+    private var lastBitmap: Bitmap? = null
+    private var lastCropRect: Rect? = null
+
+    @Volatile
+    private var lastPreviewDispatchAtMs = 0L
+
+    private val imageListener = ImageReader.OnImageAvailableListener { reader ->
+        val image = reader.acquireLatestImage() ?: return@OnImageAvailableListener
+        image.use { handleImage(it) }
+    }
+
+    private fun handleImage(image: Image) {
+        try {
+            val width = image.width
+            val bitmapHeight = image.height
+            val planes = image.planes
+
+            val buffer = planes[0].buffer
+
+            val pixelStride = planes[0].pixelStride
+            val rowStride = planes[0].rowStride
+            val rowPadding = rowStride - pixelStride * width
+
+            val bitmapWidth = width + rowPadding / pixelStride
+
+            val currentBitmap = synchronized(lastBitmapLock) {
+                var currentBitmap = lastBitmap
+
+                // Initialize if null or not match
+                if (currentBitmap == null || currentBitmap.width != bitmapWidth || currentBitmap.height != bitmapHeight) {
+                    currentBitmap = createBitmap(bitmapWidth, bitmapHeight)
+                    this.lastBitmap = currentBitmap
+                    this.lastCropRect = image.cropRect
+                }
+
+                currentBitmap.copyPixelsFromBuffer(buffer)
+                currentBitmap
+            }
+
+            dispatchPreviewFrame(currentBitmap)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to handle image", e)
+        }
+    }
+
+    private fun dispatchPreviewFrame(bitmap: Bitmap?) {
+        if (previewListeners.isEmpty()) {
+            return
+        }
+        if (bitmap != null) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastPreviewDispatchAtMs < PREVIEW_FRAME_INTERVAL_MS) {
+                return
+            }
+            lastPreviewDispatchAtMs = now
+        }
+        val preview = bitmap?.let { scaleBitmapToMaxDimension(it, PREVIEW_MAX_DIMENSION) }
+        previewListeners.forEach { listener ->
+            try {
+                listener.onPreviewFrame(preview)
+            } catch (e: Exception) {
+                Log.w(TAG, "Preview listener failed", e)
+            }
         }
     }
 
@@ -103,7 +180,9 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         Shizuku.removeRequestPermissionResultListener(this)
 
         currentJob?.cancel()
-        unregisterPreviewFrameBridge()
+        imageReader?.close()
+        imageReader = null
+        frameThread.quitSafely()
         previewListeners.clear()
         agentMessageListeners.clear()
         inferenceStatusListeners.clear()
@@ -146,11 +225,25 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         for (i in 0 until 10) {
             val service = userService
             if (service != null) {
-                return service.startDisplay(
+                val reader = ImageReader.newInstance(
                     displayMetrics.widthPixels,
                     displayMetrics.heightPixels,
-                    displayMetrics.densityDpi
+                    PixelFormat.RGBA_8888,
+                    3,
                 )
+                reader.setOnImageAvailableListener(imageListener, frameHandler)
+                if (service.startDisplay(
+                        displayMetrics.widthPixels,
+                        displayMetrics.heightPixels,
+                        displayMetrics.densityDpi,
+                        reader.surface,
+                    )
+                ) {
+                    imageReader = reader
+                    return true
+                }
+                reader.close()
+                return false
             }
             Log.i(TAG, "Waiting for user service to connect... ($i)")
             delay(1000)
@@ -159,7 +252,16 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         return false
     }
 
-    fun stopDisplay() = userService?.stopDisplay() ?: false
+    fun stopDisplay(): Boolean {
+        val stopped = userService?.stopDisplay() ?: false
+        imageReader?.close()
+        imageReader = null
+        synchronized(lastBitmapLock) {
+            lastBitmap = null
+        }
+        dispatchPreviewFrame(null)
+        return stopped
+    }
 
     fun stopAgent() {
         Log.i(TAG, "stopAgent requested")
@@ -172,8 +274,20 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         userService?.startActivity(intent, false)
     }
 
-    fun getBitmap(): Bitmap? {
-        return userService?.lastBitmap
+    fun getBitmap(): Bitmap? = synchronized(lastBitmapLock) {
+        val bitmap = lastBitmap ?: return@synchronized null
+        val cropRect = lastCropRect
+        if (cropRect != null) {
+            Bitmap.createBitmap(
+                bitmap,
+                cropRect.left,
+                cropRect.top,
+                cropRect.width(),
+                cropRect.height()
+            )
+        } else {
+            Bitmap.createBitmap(bitmap)
+        }
     }
 
     fun getFocusedAppName(): String? {
@@ -266,19 +380,6 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     private val inferenceStatusListeners = CopyOnWriteArraySet<InferenceStatusListener>()
     private val jobStateListeners = CopyOnWriteArraySet<JobStateListener>()
     private val errorListeners = CopyOnWriteArraySet<ErrorListener>()
-    private var previewListenerRegistered = false
-
-    private val previewFrameBridge = object : IPreviewFrameListener.Stub() {
-        override fun onPreviewFrame(bitmap: Bitmap?) {
-            previewListeners.forEach { listener ->
-                try {
-                    listener.onPreviewFrame(bitmap)
-                } catch (e: Exception) {
-                    Log.w(TAG, "Preview listener failed", e)
-                }
-            }
-        }
-    }
 
     suspend fun mainJob(
         userPrompt: String,
@@ -477,15 +578,11 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     }
 
     fun addPreviewListener(listener: PreviewListener) {
-        if (previewListeners.add(listener)) {
-            updatePreviewFrameBridgeRegistration()
-        }
+        previewListeners.add(listener)
     }
 
     fun removePreviewListener(listener: PreviewListener) {
-        if (previewListeners.remove(listener)) {
-            updatePreviewFrameBridgeRegistration()
-        }
+        previewListeners.remove(listener)
     }
 
     fun addAgentMessageListener(listener: AgentMessageListener) {
@@ -567,45 +664,10 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         }
     }
 
-    @Synchronized
-    private fun updatePreviewFrameBridgeRegistration() {
-        val shouldRegister = previewListeners.isNotEmpty() && userService != null
-        when {
-            shouldRegister && !previewListenerRegistered -> registerPreviewFrameBridge()
-            !shouldRegister && previewListenerRegistered -> unregisterPreviewFrameBridge()
-        }
-    }
-
-    private fun registerPreviewFrameBridge() {
-        val service = userService ?: return
-        if (previewListenerRegistered) {
-            return
-        }
-        try {
-            service.registerPreviewFrameListener(previewFrameBridge)
-            previewListenerRegistered = true
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to register preview frame listener", e)
-        }
-    }
-
-    private fun unregisterPreviewFrameBridge() {
-        val service = userService
-        if (!previewListenerRegistered || service == null) {
-            previewListenerRegistered = false
-            return
-        }
-        try {
-            service.unregisterPreviewFrameListener(previewFrameBridge)
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to unregister preview frame listener", e)
-        } finally {
-            previewListenerRegistered = false
-        }
-    }
-
     companion object {
         private const val TAG = "AgentService"
+        private const val PREVIEW_FRAME_INTERVAL_MS = 50L
+        private const val PREVIEW_MAX_DIMENSION = 1024
         const val EXTRA_AGENT_PROMPT = "moe.reimu.nekoassistant.extra.AGENT_PROMPT"
         private const val FOREGROUND_CHANNEL_ID = "agent_job"
         private const val FOREGROUND_CHANNEL_NAME = "Agent job"
