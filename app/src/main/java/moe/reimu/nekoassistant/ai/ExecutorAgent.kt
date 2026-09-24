@@ -96,6 +96,7 @@ class ExecutorAgent(
     private fun toAction(call: FunctionCall): Action? = try {
         when (call.name) {
             "SearchApp" -> json.decodeFromString(Action.SearchApp.serializer(), call.arguments)
+            "ListApps" -> json.decodeFromString(Action.ListApps.serializer(), call.arguments)
             "Launch" -> json.decodeFromString(Action.Launch.serializer(), call.arguments)
             "Tap" -> json.decodeFromString(Action.Tap.serializer(), call.arguments)
             "Type" -> json.decodeFromString(Action.Type.serializer(), call.arguments)
@@ -132,12 +133,18 @@ class ExecutorAgent(
         private val tools = listOf(
             Tool.function(
                 name = "SearchApp",
-                description = "按名称搜索已安装应用（包含匹配），返回应用的名称和包名，可能返回多个结果。query 不能为空。",
+                description = "按名称搜索已安装应用，返回应用的名称和包名，可能返回多个结果。query 不能为空。",
                 parameters = obj("query" to "string"),
             ),
             Tool.function(
+                name = "ListApps",
+                description = "列出可启动的应用，返回应用名称和包名，每页 50 个。" +
+                    "page 从 0 开始，第一次调用传 page=0，返回值会说明是否有下一页。当 SearchApp 找不到或需要浏览全部应用时使用。",
+                parameters = obj("page" to "integer"),
+            ),
+            Tool.function(
                 name = "Launch",
-                description = "按包名启动目标应用（不是显示名称）。这是启动应用的唯一方式，包名需先通过 SearchApp 获取，不要尝试用其他方法打开应用。",
+                description = "按包名启动目标应用（不是显示名称）。这是启动应用的唯一方式，如果不知道包名，需先通过 SearchApp 或 ListApps 获取，不要尝试用其他方法打开应用。",
                 parameters = obj("packageName" to "string"),
             ),
             Tool.function(

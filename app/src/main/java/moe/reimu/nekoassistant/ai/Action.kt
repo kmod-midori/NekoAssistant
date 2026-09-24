@@ -2,6 +2,7 @@ package moe.reimu.nekoassistant.ai
 
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.util.Log
 import android.view.KeyEvent
@@ -41,6 +42,57 @@ sealed class Action {
             } else {
                 ActionResult.success("匹配的应用：\n" + matches.joinToString("\n"))
             }
+        }
+    }
+
+    @Serializable
+    @SerialName("ListApps")
+    data class ListApps(val page: Int = 0) : Action() {
+        override suspend fun execute(service: AgentService): ActionResult {
+            val packageManager = service.packageManager
+            // An activity answering the launcher intent is what puts an icon in the launcher,
+            // so that is the set of apps a user would call launchable. One entry per package:
+            // an app can declare several of them.
+            val launcherIntent = Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+            val apps = packageManager.queryIntentActivities(launcherIntent, 0)
+                .mapNotNull { info ->
+                    val packageName = info.activityInfo?.packageName ?: return@mapNotNull null
+                    packageName to info.loadLabel(packageManager).toString()
+                }
+                .distinctBy { it.first }
+                .sortedBy { it.second }
+
+            if (apps.isEmpty()) {
+                return ActionResult.retry("没有找到可启动的应用")
+            }
+
+            val currentPage = page.coerceAtLeast(0)
+            val pageCount = (apps.size + PAGE_SIZE - 1) / PAGE_SIZE
+            val from = currentPage * PAGE_SIZE
+            if (from >= apps.size) {
+                return ActionResult.retry("没有第 $currentPage 页，共 $pageCount 页（page 从 0 开始）")
+            }
+
+            val listing = apps
+                .drop(from)
+                .take(PAGE_SIZE)
+                .joinToString("\n") { (packageName, label) -> "$label ($packageName)" }
+
+            val continuation = if (from + PAGE_SIZE < apps.size) {
+                "还有下一页：page=${currentPage + 1}"
+            } else {
+                "已是最后一页"
+            }
+
+            return ActionResult.success(
+                "可启动的应用（第 $currentPage 页，共 $pageCount 页，${apps.size} 个）：\n" +
+                    "$listing\n$continuation"
+            )
+        }
+
+        companion object {
+            private const val PAGE_SIZE = 50
         }
     }
 
