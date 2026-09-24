@@ -4,19 +4,38 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.text.format.DateFormat
 import android.text.format.DateUtils
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animate
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.ErrorOutline
@@ -33,20 +52,28 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import moe.reimu.nekoassistant.ai.ChatMessage
 import moe.reimu.nekoassistant.ai.InferenceStatus
 import java.util.Date
+import kotlin.math.roundToInt
 
 @Composable
 fun ChatBubble(message: ChatMessage, modifier: Modifier = Modifier) {
@@ -85,13 +112,17 @@ fun ChatBubble(message: ChatMessage, modifier: Modifier = Modifier) {
             ),
         ) {
             Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
-                Text(
-                    text = message.text,
-                    style = MaterialTheme.typography.bodyMedium,
-                    // Agent turns are machine output (JSON plans, action lines), so they
-                    // read better monospaced than wrapped as prose.
-                    fontFamily = if (isUser) FontFamily.Default else FontFamily.Monospace,
-                )
+                // Per bubble, not around the whole transcript: "select all" then copies this
+                // one turn instead of everything the agent has ever said.
+                SelectionContainer {
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        // Agent turns are machine output (JSON plans, action lines), so they
+                        // read better monospaced than wrapped as prose.
+                        fontFamily = if (isUser) FontFamily.Default else FontFamily.Monospace,
+                    )
+                }
                 Text(
                     text = remember(message.timestamp, context) {
                         formatTimestamp(context, message.timestamp)
@@ -136,6 +167,10 @@ fun ChatInputBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                // Inside the surface, so its colour runs to the screen edge behind the
+                // navigation bar instead of stopping short of the rounded corner. Union, not
+                // sum, so the keyboard inset cannot stack on top of the navigation bar's.
+                .windowInsetsPadding(WindowInsets.navigationBars.union(WindowInsets.ime))
                 .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.Bottom,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -200,55 +235,139 @@ fun AgentStatusRow(statuses: Map<String, InferenceStatus>, modifier: Modifier = 
     }
 }
 
+/** Height of the floating preview, so the transcript can reserve room for it. */
+val LiveScreenPreviewHeight = 160.dp
+
+/** Resting gap between the floating preview and the corner it sits in. */
+private val PreviewInset = 16.dp
+
 /**
- * The virtual display, pinned above the composer. It redraws as fast as frames arrive, so
- * it stays a thumbnail and opens fullscreen on tap instead of reflowing the transcript.
+ * The virtual display, floating over the transcript. It redraws as fast as frames arrive,
+ * so it stays a corner thumbnail until tapped, when it takes over the content area.
  */
 @Composable
 fun LiveScreenPreview(bitmap: Bitmap, modifier: Modifier = Modifier) {
     var expanded by remember { mutableStateOf(false) }
+
+    // Back collapses the preview instead of leaving the screen while it is open.
+    BackHandler(enabled = expanded) { expanded = false }
+    // Drag is measured from the bottom-end corner it rests in, so it survives expanding.
+    var dragOffset by remember { mutableStateOf(Offset.Zero) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var cardSize by remember { mutableStateOf(IntSize.Zero) }
+    val settle = remember { mutableStateOf<Job?>(null) }
+    val scope = rememberCoroutineScope()
     val image = remember(bitmap) { bitmap.asImageBitmap() }
+    val aspectRatio = bitmap.width.toFloat() / bitmap.height.toFloat()
+    // A screen recording has no edge of its own against the transcript behind it.
+    val border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+    // Both branches stay mounted through the swap, so the card grows out of its corner and
+    // shrinks back into it instead of cutting.
+    val appear = scaleIn(initialScale = 0.8f) + fadeIn()
+    val disappear = scaleOut(targetScale = 0.8f) + fadeOut()
 
-    Surface(color = MaterialTheme.colorScheme.surface, tonalElevation = 1.dp, modifier = modifier) {
-        Row(
+    // Fills the content area, but only the card and the scrim take touches, so the
+    // transcript behind stays scrollable.
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .onSizeChanged { containerSize = it }
+    ) {
+        AnimatedVisibility(
+            visible = !expanded,
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Image(
-                bitmap = image,
-                contentDescription = "Virtual display preview",
-                contentScale = ContentScale.Fit,
-                modifier = Modifier
-                    .height(112.dp)
-                    .aspectRatio(bitmap.width.toFloat() / bitmap.height.toFloat())
-                    .clip(RoundedCornerShape(8.dp))
-                    .clickable { expanded = true },
-            )
-            Text(
-                text = "Live screen",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-    }
+                .align(Alignment.BottomEnd)
+                .padding(PreviewInset)
+                .offset { IntOffset(dragOffset.x.roundToInt(), dragOffset.y.roundToInt()) }
+                .onSizeChanged { cardSize = it }
+                .height(LiveScreenPreviewHeight)
+                .aspectRatio(aspectRatio)
+                .pointerInput(containerSize, cardSize) {
+                    val inset = PreviewInset.toPx()
+                    // x is measured from the bottom-end corner: 0 is the resting spot,
+                    // negative moves left.
+                    val minX = cardSize.width + inset - containerSize.width
+                    val minY = cardSize.height + inset - containerSize.height
+                    val snapLeft = minX + inset
+                    val snapRight = 0f
+                    val velocityTracker = VelocityTracker()
 
-    if (expanded) {
-        Dialog(
-            onDismissRequest = { expanded = false },
-            properties = DialogProperties(usePlatformDefaultWidth = false),
+                    // Keep the whole card inside the content area. coerceAtMost before
+                    // coerceAtLeast, so an oversized card cannot invert the range and throw.
+                    fun clampX(x: Float) = x.coerceAtMost(inset).coerceAtLeast(minX)
+
+                    fun clampY(y: Float) = y.coerceAtMost(inset).coerceAtLeast(minY)
+
+                    detectDragGestures(
+                        onDragStart = {
+                            settle.value?.cancel()
+                            velocityTracker.resetTracking()
+                        },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            velocityTracker.addPosition(change.uptimeMillis, change.position)
+                            dragOffset = Offset(
+                                clampX(dragOffset.x + dragAmount.x),
+                                clampY(dragOffset.y + dragAmount.y),
+                            )
+                        },
+                        onDragEnd = {
+                            val velocity = velocityTracker.calculateVelocity().x
+                            val target = when {
+                                velocity > viewConfiguration.minimumFlingVelocity -> snapRight
+                                velocity < -viewConfiguration.minimumFlingVelocity -> snapLeft
+                                dragOffset.x > (snapLeft + snapRight) / 2 -> snapRight
+                                else -> snapLeft
+                            }
+                            settle.value = scope.launch {
+                                animate(dragOffset.x, target, velocity) { value, _ ->
+                                    dragOffset = dragOffset.copy(x = value)
+                                }
+                            }
+                        },
+                    )
+                },
+            enter = appear,
+            exit = disappear,
         ) {
-            Image(
-                bitmap = image,
-                contentDescription = "Virtual display preview",
-                contentScale = ContentScale.Fit,
+            Surface(
+                onClick = { expanded = true },
+                shape = RoundedCornerShape(12.dp),
+                shadowElevation = 8.dp,
+                border = border,
+            ) {
+                Image(
+                    bitmap = image,
+                    contentDescription = "Virtual display preview",
+                    contentScale = ContentScale.Fit,
+                )
+            }
+        }
+
+        // Last, so it is the one taking touches while the card is still animating out.
+        AnimatedVisibility(
+            visible = expanded,
+            enter = appear,
+            exit = disappear,
+        ) {
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(24.dp)
+                    .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.8f))
                     .clickable { expanded = false },
-            )
+                contentAlignment = Alignment.Center,
+            ) {
+                Image(
+                    bitmap = image,
+                    contentDescription = "Virtual display preview",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp)
+                        .border(border, RoundedCornerShape(16.dp))
+                        .clip(RoundedCornerShape(16.dp)),
+                )
+            }
         }
     }
 }

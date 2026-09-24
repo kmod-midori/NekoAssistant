@@ -12,12 +12,10 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AddComment
 import androidx.compose.material.icons.filled.Settings
@@ -61,6 +59,7 @@ import moe.reimu.nekoassistant.ui.ChatBubble
 import moe.reimu.nekoassistant.ui.ChatInputBar
 import moe.reimu.nekoassistant.ui.DefaultCard
 import moe.reimu.nekoassistant.ui.LiveScreenPreview
+import moe.reimu.nekoassistant.ui.LiveScreenPreviewHeight
 import moe.reimu.nekoassistant.ui.ProviderManagementPage
 import moe.reimu.nekoassistant.ui.SelectedLlmConfigurationCard
 import moe.reimu.nekoassistant.ui.theme.NekoAssistantTheme
@@ -154,7 +153,6 @@ fun MainPage(mainViewModel: MainViewModel = viewModel(), onManageProviders: () -
     }
 
     Scaffold(
-        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
                 title = { Text(text = stringResource(R.string.app_name)) },
@@ -179,7 +177,6 @@ fun MainPage(mainViewModel: MainViewModel = viewModel(), onManageProviders: () -
         },
         bottomBar = {
             Column {
-                uiState.previewBitmap?.let { LiveScreenPreview(it) }
                 // Only while something is running: a finished job leaves its last status,
                 // including a failed one, sitting in the map.
                 if (uiState.isAgentRunning) {
@@ -196,90 +193,120 @@ fun MainPage(mainViewModel: MainViewModel = viewModel(), onManageProviders: () -
             }
         },
     ) { innerPadding ->
-        Column(
+        Box(
             modifier = Modifier
                 .padding(innerPadding)
                 .fillMaxSize()
         ) {
-            // Anything the app needs before it can run sits above the transcript, the way a
-            // chat app shows a setup banner rather than a card in the middle of the thread.
-            val needsSetup = !shizukuStatus.granted || !shizukuStatus.available ||
-                notificationPermissionState.status != PermissionStatus.Granted ||
-                !uiState.hasActiveLlmConfiguration || uiState.errorMessage != null
-            if (needsSetup) {
-                Column(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    if (!shizukuStatus.granted || !shizukuStatus.available) {
-                        ShizukuCard(shizukuStatus)
-                    }
+            Column(modifier = Modifier.fillMaxSize()) {
+                SetupBanners(
+                    shizukuStatus = shizukuStatus,
+                    notificationPermissionState = notificationPermissionState,
+                    uiState = uiState,
+                    onManageProviders = onManageProviders,
+                )
 
-                    if (notificationPermissionState.status != PermissionStatus.Granted) {
-                        DefaultCard(onClick = { notificationPermissionState.launchPermissionRequest() }) {
-                            Column(modifier = Modifier.padding(16.dp)) {
-                                Text(
-                                    text = "Notification permission not granted",
-                                    style = MaterialTheme.typography.titleMedium,
-                                )
-                            }
-                        }
-                    }
-
-                    if (!uiState.hasActiveLlmConfiguration) {
-                        SelectedLlmConfigurationCard(
-                            providers = uiState.llmProviders,
-                            onClick = onManageProviders,
+                if (uiState.messages.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth(),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            text = "Tell the agent what to do on the virtual display.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(32.dp),
                         )
                     }
-
-                    uiState.errorMessage?.let { message ->
-                        DefaultCard {
-                            Column(modifier = Modifier.padding(16.dp)) {
-                                Text(
-                                    text = "Error",
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = MaterialTheme.colorScheme.error,
-                                    modifier = Modifier.padding(bottom = 4.dp)
-                                )
-                                Text(
-                                    text = message,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (uiState.messages.isEmpty()) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth(),
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Text(
-                        text = "Tell the agent what to do on the virtual display.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(32.dp),
-                    )
-                }
-            } else {
-                // Selectable, so agent output can be copied out of the transcript.
-                SelectionContainer(modifier = Modifier.weight(1f)) {
+                } else {
                     LazyColumn(
                         state = listState,
-                        modifier = Modifier.fillMaxSize(),
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxSize(),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
-                        contentPadding = PaddingValues(16.dp),
+                        contentPadding = PaddingValues(
+                            start = 16.dp,
+                            end = 16.dp,
+                            top = 16.dp,
+                            // Room for the floating preview to sit over.
+                            bottom = if (uiState.previewBitmap != null) {
+                                LiveScreenPreviewHeight + 32.dp
+                            } else {
+                                16.dp
+                            },
+                        ),
                     ) {
                         items(uiState.messages) { message ->
                             ChatBubble(message)
                         }
                     }
+                }
+            }
+
+            uiState.previewBitmap?.let { LiveScreenPreview(it) }
+        }
+    }
+}
+
+/** Anything the app needs before it can run, above the transcript rather than in it. */
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+private fun SetupBanners(
+    shizukuStatus: ShizukuStatus,
+    notificationPermissionState: PermissionState,
+    uiState: UiState,
+    onManageProviders: () -> Unit,
+) {
+    if (shizukuStatus.granted && shizukuStatus.available &&
+        notificationPermissionState.status == PermissionStatus.Granted &&
+        uiState.hasActiveLlmConfiguration && uiState.errorMessage == null
+    ) {
+        return
+    }
+
+    Column(
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        if (!shizukuStatus.granted || !shizukuStatus.available) {
+            ShizukuCard(shizukuStatus)
+        }
+
+        if (notificationPermissionState.status != PermissionStatus.Granted) {
+            DefaultCard(onClick = { notificationPermissionState.launchPermissionRequest() }) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Notification permission not granted",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                }
+            }
+        }
+
+        if (!uiState.hasActiveLlmConfiguration) {
+            SelectedLlmConfigurationCard(
+                providers = uiState.llmProviders,
+                onClick = onManageProviders,
+            )
+        }
+
+        uiState.errorMessage?.let { message ->
+            DefaultCard {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Text(
+                        text = "Error",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(bottom = 4.dp)
+                    )
+                    Text(
+                        text = message,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
             }
         }
