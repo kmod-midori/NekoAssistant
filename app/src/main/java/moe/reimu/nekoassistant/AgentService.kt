@@ -293,6 +293,10 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         val rowPadding = plane.rowStride - plane.pixelStride * width
 
         val padded = createBitmap(width + rowPadding / plane.pixelStride, image.height)
+        // Every agent step screenshots the same held frame until a new one arrives, and
+        // copyPixelsFromBuffer reads from the buffer's current position — without the rewind
+        // the second read starts at the end of a buffer that is now empty.
+        plane.buffer.rewind()
         padded.copyPixelsFromBuffer(plane.buffer)
 
         val cropRect = image.cropRect
@@ -473,7 +477,7 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
                 Log.i(TAG, "actionResult.stop == true, stopping")
                 break
             }
-            plannerAgent.addActionResult(actionResult.prompt)
+            plannerAgent.addActionResult(agentResponse.action, actionResult.prompt)
             delay(3000.milliseconds) // Wait for the action to take effect and screen to update
         }
 

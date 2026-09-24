@@ -85,11 +85,13 @@ class PlannerAgent(
         return assistantMessage.content?.replace(thinkingRegex, "")
     }
 
-    fun addActionResult(prompt: String) {
+    /** The call as well as its result: the result alone reads the same whether the executor
+     *  tapped (100,200) or swiped across it. */
+    fun addActionResult(action: Action, prompt: String) {
         chatHistory.add(
             ChatMessage(
                 role = ChatRole.User,
-                content = "上一步操作执行结果：$prompt"
+                content = "上一步操作：$action\n上一步操作执行结果：$prompt"
             )
         )
     }
