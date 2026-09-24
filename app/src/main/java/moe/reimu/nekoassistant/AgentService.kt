@@ -29,6 +29,7 @@ import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.ProcessLifecycleOwner
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -197,6 +198,7 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         inferenceStatusListeners.clear()
         jobStateListeners.clear()
         errorListeners.clear()
+        takeOverListeners.clear()
         stopJobForeground()
         try {
             userService?.destroy()
@@ -281,6 +283,40 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
     }
 
     fun isAgentRunning(): Boolean = currentJob?.isActive == true
+
+    /** What the agent is waiting on the user for, or null while it is not waiting. */
+    fun getTakeOverMessage(): String? = takeOverMessage
+
+    fun resumeAgent() {
+        Log.i(TAG, "resumeAgent requested")
+        takeOverResume?.complete(Unit)
+    }
+
+    /**
+     * Parks the agent until the user says it may continue. The action itself does the waiting,
+     * so the step loop resumes on the same planner history instead of restarting the task,
+     * with the display and the live preview still up.
+     */
+    suspend fun awaitUserTakeOver(message: String) {
+        val resume = CompletableDeferred<Unit>()
+        // The signal first: a resume landing between the two writes would otherwise find no
+        // request to answer and leave the agent waiting on a message the user already saw.
+        takeOverResume = resume
+        takeOverMessage = message
+        notifyTakeOverListeners(message)
+        postTakeOverNotification(message)
+
+        try {
+            resume.await()
+        } finally {
+            // Also the cancellation path: stopping the agent mid-takeover has to clear the
+            // request, or the screen keeps asking for something nobody is waiting on.
+            takeOverMessage = null
+            takeOverResume = null
+            notifyTakeOverListeners(null)
+            cancelTakeOverNotification()
+        }
+    }
 
     fun startActivityRemote(intent: Intent) {
         userService?.startActivity(intent, false)
@@ -394,7 +430,19 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         fun onError(message: String)
     }
 
+    fun interface TakeOverListener {
+        fun onTakeOver(message: String?)
+    }
+
     private val previewListeners = CopyOnWriteArraySet<PreviewListener>()
+
+    // Written by the agent's coroutine and read by whoever binds, so it is volatile rather
+    // than carried on a listener that only exists while the screen does.
+    @Volatile
+    private var takeOverMessage: String? = null
+    @Volatile
+    private var takeOverResume: CompletableDeferred<Unit>? = null
+    private val takeOverListeners = CopyOnWriteArraySet<TakeOverListener>()
 
     // The conversation lives here, not in the screen, so closing the activity mid-run and
     // reopening it resumes the same transcript.
@@ -576,16 +624,7 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
             .setContentText("Agent task is in progress")
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setContentIntent(
-                PendingIntent.getActivity(
-                    this,
-                    0,
-                    Intent(this, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    },
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-            )
+            .setContentIntent(openAppPendingIntent())
             .build()
 
     private fun postErrorNotification(message: String) {
@@ -595,19 +634,58 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
             .setContentTitle("NekoAssistant error")
             .setContentText(message)
             .setAutoCancel(true)
-            .setContentIntent(
-                PendingIntent.getActivity(
-                    this,
-                    0,
-                    Intent(this, MainActivity::class.java).apply {
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-                    },
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-            )
+            .setContentIntent(openAppPendingIntent())
             .build()
         val manager = getSystemService(NotificationManager::class.java)
         manager.notify(ERROR_NOTIFICATION_ID, notification)
+    }
+
+    /**
+     * Alerts rather than informs: the run is parked until the user answers, so this one gets a
+     * channel of its own instead of riding along on the quiet foreground one.
+     */
+    private fun postTakeOverNotification(message: String) {
+        ensureTakeOverNotificationChannel()
+        val notification = NotificationCompat.Builder(this, TAKE_OVER_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("NekoAssistant needs you")
+            .setContentText(message)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(message))
+            .setAutoCancel(true)
+            .setContentIntent(openAppPendingIntent())
+            .build()
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.notify(TAKE_OVER_NOTIFICATION_ID, notification)
+    }
+
+    private fun cancelTakeOverNotification() {
+        getSystemService(NotificationManager::class.java).cancel(TAKE_OVER_NOTIFICATION_ID)
+    }
+
+    private fun openAppPendingIntent() =
+        PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+    private fun ensureTakeOverNotificationChannel() {
+        val manager = getSystemService(NotificationManager::class.java)
+        if (manager.getNotificationChannel(TAKE_OVER_CHANNEL_ID) != null) {
+            return
+        }
+
+        val channel = NotificationChannel(
+            TAKE_OVER_CHANNEL_ID,
+            TAKE_OVER_CHANNEL_NAME,
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = TAKE_OVER_CHANNEL_DESCRIPTION
+        }
+        manager.createNotificationChannel(channel)
     }
 
     fun addPreviewListener(listener: PreviewListener) {
@@ -648,6 +726,24 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
 
     fun removeErrorListener(listener: ErrorListener) {
         errorListeners.remove(listener)
+    }
+
+    fun addTakeOverListener(listener: TakeOverListener) {
+        takeOverListeners.add(listener)
+    }
+
+    fun removeTakeOverListener(listener: TakeOverListener) {
+        takeOverListeners.remove(listener)
+    }
+
+    private fun notifyTakeOverListeners(message: String?) {
+        takeOverListeners.forEach { listener ->
+            try {
+                listener.onTakeOver(message)
+            } catch (e: Exception) {
+                Log.w(TAG, "Take over listener failed", e)
+            }
+        }
     }
 
     private fun notifyJobState(running: Boolean) {
@@ -739,5 +835,10 @@ class AgentService : LifecycleService(), Shizuku.OnBinderReceivedListener,
         private const val FOREGROUND_CHANNEL_DESCRIPTION = "Runs agent automation tasks"
         private const val FOREGROUND_NOTIFICATION_ID = 1001
         private const val ERROR_NOTIFICATION_ID = 1002
+        private const val TAKE_OVER_NOTIFICATION_ID = 1003
+        private const val TAKE_OVER_CHANNEL_ID = "agent_take_over"
+        private const val TAKE_OVER_CHANNEL_NAME = "Agent needs you"
+        private const val TAKE_OVER_CHANNEL_DESCRIPTION =
+            "Asks for help while an agent task is waiting on you"
     }
 }

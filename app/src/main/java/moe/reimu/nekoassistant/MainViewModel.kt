@@ -30,6 +30,7 @@ data class UiState(
     val messages: List<ChatMessage> = emptyList(),
     val inferenceStatuses: Map<String, InferenceStatus> = emptyMap(),
     val errorMessage: String? = null,
+    val takeOverMessage: String? = null,
     val llmProviders: List<LlmProviderWithModels> = emptyList(),
 ) {
     val hasActiveLlmConfiguration: Boolean
@@ -76,6 +77,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         updateUi { it.copy(errorMessage = message) }
     }
 
+    private val takeOverListener = AgentService.TakeOverListener { message ->
+        updateUi { it.copy(takeOverMessage = message) }
+    }
+
     @SuppressLint("StaticFieldLeak")
     private var agentService: AgentService? = null
     private var errorListenerActive = false
@@ -91,6 +96,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 // service has rather than starting from an empty transcript.
                 messages = service.getTranscript(),
                 inferenceStatuses = service.getInferenceStatuses(),
+                takeOverMessage = service.getTakeOverMessage(),
             )
             registerServiceListeners(service)
             if (errorListenerActive) {
@@ -106,6 +112,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 previewBitmap = null,
                 inferenceStatuses = emptyMap(),
                 errorMessage = null,
+                takeOverMessage = null,
             )
         }
     }
@@ -129,6 +136,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         service.addTranscriptListener(transcriptListener)
         service.addInferenceStatusListener(inferenceStatusListener)
         service.addJobStateListener(jobStateListener)
+        service.addTakeOverListener(takeOverListener)
     }
 
     private fun removeServiceListeners(service: AgentService) {
@@ -136,6 +144,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         service.removeTranscriptListener(transcriptListener)
         service.removeInferenceStatusListener(inferenceStatusListener)
         service.removeJobStateListener(jobStateListener)
+        service.removeTakeOverListener(takeOverListener)
     }
 
     fun updateAgentPrompt(prompt: String) {
@@ -159,6 +168,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopAgent() {
         agentService?.stopAgent()
+    }
+
+    fun resumeAgent() {
+        agentService?.resumeAgent()
     }
 
     fun newChat() {

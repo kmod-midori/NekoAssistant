@@ -48,6 +48,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -192,6 +193,43 @@ fun ChatInputBar(
                     imageVector = if (isRunning) Icons.Default.Stop else Icons.AutoMirrored.Filled.Send,
                     contentDescription = if (isRunning) "Stop" else "Send",
                 )
+            }
+        }
+    }
+}
+
+/**
+ * The agent has parked itself and is waiting for the user to do something it cannot. Pinned
+ * above the composer rather than put in the transcript, since it is the one thing on screen
+ * that is blocking the run.
+ */
+@Composable
+fun TakeOverNotice(message: String, onResume: () -> Unit, modifier: Modifier = Modifier) {
+    Surface(
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+        tonalElevation = 3.dp,
+        modifier = modifier,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "The agent needs you",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            TextButton(onClick = onResume) {
+                Text("Continue")
             }
         }
     }

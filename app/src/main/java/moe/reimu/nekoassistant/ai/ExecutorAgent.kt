@@ -170,7 +170,7 @@ class ExecutorAgent(
             ),
             Tool.function(
                 name = "TakeOver",
-                description = "接管操作，表示在登录和验证阶段需要用户协助。",
+                description = "接管操作，表示在登录和验证阶段需要用户协助。message 尽量简洁。",
                 parameters = obj("message" to "string"),
             ),
             Tool.function(

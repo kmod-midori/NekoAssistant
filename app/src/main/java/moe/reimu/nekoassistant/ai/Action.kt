@@ -170,9 +170,10 @@ sealed class Action {
     @Serializable
     @SerialName("TakeOver")
     data class TakeOver(val message: String) : Action() {
-        // ponytail: stub — no real implementation yet
-        override suspend fun execute(service: AgentService): ActionResult =
-            ActionResult.fail("TakeOver 尚未实现")
+        override suspend fun execute(service: AgentService): ActionResult {
+            service.awaitUserTakeOver(message)
+            return ActionResult.success("用户已接管完成，请先检查当前界面，再决定下一步操作")
+        }
     }
 
     @Serializable

@@ -62,6 +62,7 @@ import moe.reimu.nekoassistant.ui.LiveScreenPreview
 import moe.reimu.nekoassistant.ui.LiveScreenPreviewHeight
 import moe.reimu.nekoassistant.ui.ProviderManagementPage
 import moe.reimu.nekoassistant.ui.SelectedLlmConfigurationCard
+import moe.reimu.nekoassistant.ui.TakeOverNotice
 import moe.reimu.nekoassistant.ui.theme.NekoAssistantTheme
 import rikka.shizuku.Shizuku
 
@@ -177,6 +178,9 @@ fun MainPage(mainViewModel: MainViewModel = viewModel(), onManageProviders: () -
         },
         bottomBar = {
             Column {
+                uiState.takeOverMessage?.let { message ->
+                    TakeOverNotice(message = message, onResume = mainViewModel::resumeAgent)
+                }
                 // Only while something is running: a finished job leaves its last status,
                 // including a failed one, sitting in the map.
                 if (uiState.isAgentRunning) {
