@@ -11,7 +11,7 @@ import kotlinx.serialization.Serializable
 import moe.reimu.nekoassistant.AgentService
 import kotlin.math.pow
 import kotlin.random.Random
-import kotlin.random.nextLong
+import kotlin.time.Duration.Companion.milliseconds
 
 @Serializable
 sealed class Action {
@@ -105,14 +105,6 @@ sealed class Action {
     }
 
     @Serializable
-    @SerialName("Type_Name")
-    data class TypeName(val text: String) : Action()
-
-    @Serializable
-    @SerialName("Interact")
-    data object Interact : Action()
-
-    @Serializable
     @SerialName("Swipe")
     data class Swipe(val startX: Float, val startY: Float, val endX: Float, val endY: Float) :
         Action() {
@@ -133,31 +125,50 @@ sealed class Action {
     }
 
     @Serializable
-    @SerialName("Note")
-    data class Note(val message: String) : Action()
-
-    @Serializable
-    @SerialName("Call_API")
-    data class Summarize(val instruction: String) : Action()
-
-    @Serializable
-    @SerialName("Long_Press")
+    @SerialName("LongPress")
     data class LongPress(val x: Int, val y: Int) : Action() {
-        // ponytail: stub — no real implementation yet
-        override suspend fun execute(service: AgentService): ActionResult =
-            ActionResult.fail("LongPress 尚未实现")
+        override suspend fun execute(service: AgentService): ActionResult {
+            val screenX = service.mapXToScreen(x.toFloat())
+                ?: return ActionResult.retry("X坐标不在范围内，最大值为${service.screenshotSize.width - 1}，请调整")
+            val screenY = service.mapYToScreen(y.toFloat())
+                ?: return ActionResult.retry("Y坐标不在范围内，最大值为${service.screenshotSize.height - 1}，请调整")
+
+            return if (service.injectSwipeEvent(
+                    screenX, screenY,
+                    screenX, screenY,
+                    Random.nextLong(900, 1000),
+            )) {
+                ActionResult.success()
+            } else {
+                ActionResult.fail()
+            }
+        }
     }
 
     @Serializable
-    @SerialName("Double_Tap")
+    @SerialName("DoubleTap")
     data class DoubleTap(val x: Int, val y: Int) : Action() {
-        // ponytail: stub — no real implementation yet
-        override suspend fun execute(service: AgentService): ActionResult =
-            ActionResult.fail("DoubleTap 尚未实现")
+        override suspend fun execute(service: AgentService): ActionResult {
+            val screenX = service.mapXToScreen(x.toFloat())
+                ?: return ActionResult.retry("X坐标不在范围内，最大值为${service.screenshotSize.width - 1}，请调整")
+            val screenY = service.mapYToScreen(y.toFloat())
+                ?: return ActionResult.retry("Y坐标不在范围内，最大值为${service.screenshotSize.height - 1}，请调整")
+
+            if (!service.injectTapEvent(screenX, screenY)) {
+                return ActionResult.fail()
+            }
+
+            delay(Random.nextLong(100, 160).milliseconds)
+
+            if (!service.injectTapEvent(screenX, screenY)) {
+                return ActionResult.fail()
+            }
+            return ActionResult.success()
+        }
     }
 
     @Serializable
-    @SerialName("Take_over")
+    @SerialName("TakeOver")
     data class TakeOver(val message: String) : Action() {
         // ponytail: stub — no real implementation yet
         override suspend fun execute(service: AgentService): ActionResult =
@@ -176,18 +187,10 @@ sealed class Action {
     }
 
     @Serializable
-    @SerialName("Home")
-    data object Home : Action() {
-        // ponytail: stub — no real implementation yet
-        override suspend fun execute(service: AgentService): ActionResult =
-            ActionResult.fail("Home 尚未实现")
-    }
-
-    @Serializable
     @SerialName("Wait")
     data class Wait(val seconds: Int) : Action() {
         override suspend fun execute(service: AgentService): ActionResult {
-            delay(seconds * 1000L)
+            delay((seconds * 1000L).milliseconds)
             return ActionResult.success()
         }
     }

@@ -100,13 +100,10 @@ class ExecutorAgent(
             "Tap" -> json.decodeFromString(Action.Tap.serializer(), call.arguments)
             "Type" -> json.decodeFromString(Action.Type.serializer(), call.arguments)
             "Swipe" -> json.decodeFromString(Action.Swipe.serializer(), call.arguments)
-            "Note" -> json.decodeFromString(Action.Note.serializer(), call.arguments)
-            "Summarize" -> json.decodeFromString(Action.Summarize.serializer(), call.arguments)
             "LongPress" -> json.decodeFromString(Action.LongPress.serializer(), call.arguments)
             "DoubleTap" -> json.decodeFromString(Action.DoubleTap.serializer(), call.arguments)
             "TakeOver" -> json.decodeFromString(Action.TakeOver.serializer(), call.arguments)
             "Back" -> Action.Back
-            "Home" -> Action.Home
             "Wait" -> json.decodeFromString(Action.Wait.serializer(), call.arguments)
             "Finish" -> Action.Finish
             else -> null
@@ -162,16 +159,6 @@ class ExecutorAgent(
                 ),
             ),
             Tool.function(
-                name = "Note",
-                description = "记录当前页面内容以便后续总结。",
-                parameters = obj("message" to "string"),
-            ),
-            Tool.function(
-                name = "Summarize",
-                description = "总结已记录的内容。",
-                parameters = obj("instruction" to "string"),
-            ),
-            Tool.function(
                 name = "LongPress",
                 description = "在屏幕上的特定点长按，用于触发上下文菜单、选择文本或激活长按交互。",
                 parameters = obj("x" to "integer", "y" to "integer"),
@@ -189,11 +176,6 @@ class ExecutorAgent(
             Tool.function(
                 name = "Back",
                 description = "返回到上一个屏幕或关闭当前对话框，相当于按下 Android 返回按钮。",
-                parameters = Parameters.Empty,
-            ),
-            Tool.function(
-                name = "Home",
-                description = "回到系统桌面，相当于按下 Android 主屏幕按钮。",
                 parameters = Parameters.Empty,
             ),
             Tool.function(
